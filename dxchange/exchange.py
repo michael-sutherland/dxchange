@@ -1135,7 +1135,7 @@ def read_lnls_imx(folder, proj=None, sino=None):
 
 def read_nsls2_fxi18_h5(fname, proj=None, sino=None):
     """
-    Read LNLS IMX standard data format.
+    Read NSLS2 beamline FXI-18 exported HDF5 files for fly scans.
 
     Parameters
     ----------
