@@ -87,6 +87,7 @@ __all__ = ['read_als_832',
            'read_esrf_id19',
            'read_lnls_imx',
            'read_nsls2_fxi18_h5',
+           'read_nsls2_fxi18_db',
            'read_petraIII_p05',
            'read_sls_tomcat']
 
@@ -1169,6 +1170,10 @@ def read_nsls2_fxi18_h5(fname, proj=None, sino=None):
     theta = dxreader.read_hdf5(fname, 'angle', slc=(proj,))
     theta = np.deg2rad(theta)
     return tomo, flats, darks, theta
+
+
+# pull in from dxreader, has databroker optional dependency
+read_nsls2_fxi18_db = dxreader.read_nsls2_fxi18_db
 
 
 def read_petraIII_p05(

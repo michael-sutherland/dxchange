@@ -94,6 +94,7 @@ __all__ = ['read_dx_meta',
 
 logger = logging.getLogger(__name__)
 
+EPICS_TO_UNIX_OFFSET = 631152000 # seconds from 1970 to 1990 to convert EPICS EPOCH to UNIX EPOCH
 
 def _check_import(modname):
     try:
@@ -108,6 +109,7 @@ netCDF4 = _check_import('netCDF4')
 EdfFile = _check_import('EdfFile')
 astropy = _check_import('astropy')
 olefile = _check_import('olefile')
+databroker = _check_import('databroker')
 
 # FIXME: raise exception would make more sense, also not sure an extension check
 # is very useful, unless we are automatically mapping an extension to a
@@ -1200,3 +1202,153 @@ def read_file_list(file_list):
         arr[i+1] = readfunc(fn)
     
     return arr
+
+
+def read_nsls2_fxi18_db(scan_id, catalog_name="fxi", proj=None, sino=None):
+    """
+    Read NSLS2 beamline FXI-18 data directly from databroker.  Only fly scans currently supported.
+
+    Parameters
+    ----------
+    scan_id : str or int
+        If string, this is interpreted as a UID.  If negative int, this is a relative import for the most recent scan
+        in the database (-1 is most recent, -2 is second most recent, etc...).  If positive int, this is interpreted as
+        a scan_id, which is not guaranteed to be unique.
+
+    catalog_name : str or None
+        This is the catalog name in databroker.  Value defaults to "fxi", which is the catalog name for this beamline
+        at NSLS2.  If None is passed in, all available catalogs in databroker will be searched.
+
+    proj : {sequence, int}, optional
+        Specify projections to read. (start, end, step)
+
+    sino : {sequence, int}, optional
+        Specify sinograms to read. (start, end, step)
+
+    Returns
+    -------
+    ndarray
+        3D tomographic data.
+
+    ndarray
+        3D flat field data.
+
+    ndarray
+        3D dark field data.
+
+    dict
+        metadata.
+
+    """
+    if catalog_name is not None:
+        catalog_names = [catalog_name]
+    else:
+        catalog_names = list(databroker.catalog)
+
+    for catalog_name in catalog_names:
+        catalog = databroker.catalog[catalog_name]
+        try:
+            run = catalog[scan_id]
+        except:
+            continue
+        start_metadata = run.metadata['start']
+        plan_name = start_metadata["plan_name"]
+        print(plan_name)
+        if plan_name == "fly_scan":
+            return _nsls2_fxi18_load_fly_scan_db(run, start_metadata, proj, sino)
+        elif plan_name in ("user_fly_only", "dmea_fly_only"):
+            return _nsls2_fxi18_load_user_fly_only_db(run, start_metadata, catalog, proj, sino)
+        else:
+            raise Exception(
+                "scan_id %s has unsupported plan_name %s in catalog %s" % (str(scan_id), plan_name, catalog_name))
+
+    raise Exception("scan_id %s not found in catalogs %s" % (str(scan_id), str(catalog_names)))
+
+
+def _nsls2_fxi18_load_metadata(run, start_metadata):
+    """Load metadata from scan."""
+    metadata = {}
+    # start metadata
+    metadata['start'] = start_metadata
+    metadata['uid'] = start_metadata['uid']
+    metadata['operator'] = start_metadata['operator']
+    metadata['scan_id'] = start_metadata['scan_id']
+    metadata['plan_name'] = start_metadata['plan_name']
+    metadata['note'] = start_metadata.get('note', '')
+    energy = start_metadata.get('XEng')
+    if energy is None:
+        energy = start_metadata.get('x_ray_energy')
+    metadata['energy'] = energy
+    # baseline metadata - record values from after run
+    baseline = run.baseline.read()
+    metadata['baseline'] = baseline
+    metadata['x_pos'] = baseline['zps_sx'][1]
+    metadata['y_pos'] = baseline['zps_sy'][1]
+    metadata['z_pos'] = baseline['zps_sz'][1]
+    metadata['r_pos'] = baseline['zps_pi_r'][1]
+    return metadata
+
+
+def _nsls2_fxi18_load_thetas(run):
+    """Load thetas from fly scan.  The stage has a monitor and the timestamps from the camera
+    have to be interpolated with the stage to get the stage position."""
+    rotation_deg = np.array(run.zps_pi_r_monitor.to_dask()['zps_pi_r'])
+    rotation_time = np.array(run.zps_pi_r_monitor.to_dask()['time'])  # UNIX EPOCH
+    img_time = np.array(run.primary.to_dask()['Andor_timestamps'])  # EPICS EPOCH
+    img_time = np.concatenate(img_time, axis=0)  # remove chunking
+    img_time += EPICS_TO_UNIX_OFFSET  # Convert EPICS to UNIX TIMESTAMP
+
+    # Interpolate rotation angle for each projection
+    thetas = np.deg2rad(np.interp(img_time, rotation_time, rotation_deg))
+    return thetas
+
+
+def _nsls2_fxi18_load_fly_scan_db(run, start_metadata, proj=None, sino=None):
+    # load fly_scan from NSLS-II FXI-18 on databroker
+    metadata = _nsls2_fxi18_load_metadata(run, start_metadata)
+
+    # load images
+    # 4D array of (chunks, image_in_chunk, y, x)
+    # 1st chunk is dark
+    # last chunk is bkg
+    chunks = run.primary.to_dask()['Andor_image'].data
+    darks = np.array(_slice_array(chunks[0], (None, sino)))
+    flats = np.array(_slice_array(chunks[-1], (None, sino)))
+    projs = chunks[1:-1].reshape(-1, chunks.shape[2], chunks.shape[3]) # dask array at this point
+    projs = np.array(_slice_array(projs, (proj, sino))) # slice and convert to ndarray
+
+    # load thetas
+    thetas = _nsls2_fxi18_load_thetas(run)
+    # remove flats and darks
+    thetas = thetas[darks.shape[0]:-flats.shape[0]]
+    # only keep thetas for proj slice
+    thetas = _slice_array(thetas, (proj,))
+    metadata['thetas'] = thetas
+
+    return projs, flats, darks, metadata
+
+
+def _nsls2_fxi18_load_user_fly_only_db(run, start_metadata, catalog, proj=None, sino=None):
+    # load user_fly_scan from NSLS-II FXI-18 on databroker
+    metadata = _nsls2_fxi18_load_metadata(run, start_metadata)
+
+    # load images
+    # 4D array of chunks, image_in_chunk, y, x
+    chunks = run.primary.to_dask()['Andor_image'].data
+    projs = chunks.reshape(-1, chunks.shape[2], chunks.shape[3]) # dask array at this point
+    projs = np.array(_slice_array(projs, (proj, sino))) # slice and convert to ndarray
+
+    # load background and darks
+    print(list(start_metadata))
+    flats = catalog[start_metadata['plan_args']['bkg_scan_id']].primary.to_dask()['Andor_image'].data.squeeze()
+    flats = np.array(_slice_array(flats, (None, sino)))
+    darks = catalog[start_metadata['plan_args']['dark_scan_id']].primary.to_dask()['Andor_image'].data.squeeze()
+    darks = np.array(_slice_array(darks, (None, sino)))
+
+    # load thetas
+    thetas = _nsls2_fxi18_load_thetas(run)
+    # only keep thetas for proj slice
+    thetas = _slice_array(thetas, (proj,))
+    metadata['thetas'] = thetas
+
+    return projs, flats, darks, metadata
