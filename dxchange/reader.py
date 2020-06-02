@@ -56,6 +56,7 @@ from __future__ import (absolute_import, division, print_function,
 import numpy as np
 import six
 import os
+import sys
 import h5py
 import logging
 import re
@@ -110,6 +111,7 @@ EdfFile = _check_import('EdfFile')
 astropy = _check_import('astropy')
 olefile = _check_import('olefile')
 databroker = _check_import('databroker')
+
 
 # FIXME: raise exception would make more sense, also not sure an extension check
 # is very useful, unless we are automatically mapping an extension to a
@@ -671,7 +673,7 @@ def read_hdf5_item_structure(meta, fp, file_name, offset='    ', label1='/measur
             s = fp.name.split('/')
             name = s[-1].replace('-', '_')
             
-            value = dxreader.read_hdf5(file_name,  fp.name)[0]
+            value = read_hdf5(file_name,  fp.name)[0]
             if  (value.dtype.kind == 'S'):
                 value = value.decode(encoding="utf-8")
             meta.update( {name : value} )
